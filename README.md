@@ -44,7 +44,8 @@ This project provides a production-ready VPC infrastructure that prioritizes cos
 - ARM-based t4g.nano instances (lowest cost option)
 - Optional spot instances for non-critical workloads
 - Minimal instance footprint with efficient NAT configuration
-- Automatic scaling to maintain exactly one NAT instance per AZ
+- Optional shared NAT instance mode for single-instance cost savings across all AZs
+- Automatic scaling to maintain exactly one NAT instance per AZ (or one shared instance)
 
 ## Cost Comparison
 
@@ -65,6 +66,7 @@ See [quickstart.md](quickstart.md) for detailed deployment instructions with fou
 
 ## Key Features
 
+- **Shared NAT Mode**: Optional single NAT instance shared across all AZs for maximum cost savings
 - **Configurable AZ Count**: Deploy across 1-3 availability zones
 - **Spot Instance Support**: Optional spot instances across all AZs for maximum cost savings
 - **Auto-Recovery**: Automatic replacement of failed NAT instances

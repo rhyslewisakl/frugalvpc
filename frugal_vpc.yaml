@@ -26,6 +26,13 @@ Parameters:
     AllowedValues: ['true', 'false']
     ConstraintDescription: Must be true or false
   
+  UseSharedNAT:
+    Type: String
+    Description: Use a single shared NAT instance for all AZs (cheaper but single point of failure, suitable for dev environments)
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be true or false
+  
   PythonScriptUrl:
     Type: String
     Description: URL to Python script to run on NAT instances (optional)
@@ -67,6 +74,9 @@ Conditions:
   Create2AZ: !Or [!Equals [!Ref NumberOfAZs, 2], !Equals [!Ref NumberOfAZs, 3]]
   Create3AZ: !Equals [!Ref NumberOfAZs, 3]
   UseSpot: !Equals [!Ref UseSpotInstances, 'true']
+  SharedNAT: !Equals [!Ref UseSharedNAT, 'true']
+  CreateNAT2: !And [!Condition Create2AZ, !Not [!Condition SharedNAT]]
+  CreateNAT3: !And [!Condition Create3AZ, !Not [!Condition SharedNAT]]
 
 Resources:
   # VPC and Core Networking
@@ -495,7 +505,7 @@ Resources:
 
   NATAutoScalingGroup2:
     Type: AWS::AutoScaling::AutoScalingGroup
-    Condition: Create2AZ
+    Condition: CreateNAT2
     Properties:
       AutoScalingGroupName: !Sub ${InstanceName}-${AWS::StackName}-nat-asg-2
       VPCZoneIdentifier:
@@ -514,7 +524,7 @@ Resources:
 
   NATAutoScalingGroup3:
     Type: AWS::AutoScaling::AutoScalingGroup
-    Condition: Create3AZ
+    Condition: CreateNAT3
     Properties:
       AutoScalingGroupName: !Sub ${InstanceName}-${AWS::StackName}-nat-asg-3
       VPCZoneIdentifier:
@@ -565,6 +575,9 @@ Resources:
       Handler: index.lambda_handler
       Role: !GetAtt RouteTableUpdaterRole.Arn
       Timeout: 60
+      Environment:
+        Variables:
+          SHARED_NAT: !Ref UseSharedNAT
       Code:
         ZipFile: |
           import json
@@ -600,50 +613,41 @@ Resources:
                       logger.info(f"Instance {instance_id} is not a NAT instance (Role: {tags.get('Role')})")
                       return {'statusCode': 200, 'body': 'Not a NAT instance'}
                   
+                  import os
+                  shared_nat = os.environ.get('SHARED_NAT', 'false') == 'true'
                   az = instance['Placement']['AvailabilityZone']
                   instance_name = tags.get('Name', '').split('-nat-')[0] if '-nat-' in tags.get('Name', '') else 'frugal-vpc'
                   stack_name = tags.get('StackName', '')
-                  route_table_name = f"{instance_name}-{stack_name}-private-rt-{az[-1]}"
-                  logger.info(f"Looking for route table: {route_table_name} in AZ: {az} (instance_name: {instance_name}, stack_name: {stack_name})")
                   
-                  rt_response = ec2.describe_route_tables(
-                      Filters=[{'Name': 'tag:Name', 'Values': [route_table_name]}]
-                  )
-                  logger.info(f"Route table search returned {len(rt_response['RouteTables'])} results")
-                  
-                  if not rt_response['RouteTables']:
-                      logger.error(f"Route table {route_table_name} not found")
-                      return {'statusCode': 404, 'body': 'Route table not found'}
-                  
-                  route_table_id = rt_response['RouteTables'][0]['RouteTableId']
-                  route_table = rt_response['RouteTables'][0]
-                  logger.info(f"Found route table {route_table_id}, checking existing routes")
-                  
-                  # Check if 0.0.0.0/0 route already exists
-                  existing_route = None
-                  for route in route_table.get('Routes', []):
-                      if route.get('DestinationCidrBlock') == '0.0.0.0/0':
-                          existing_route = route
-                          break
-                  
-                  if existing_route:
-                      logger.info(f"Found existing 0.0.0.0/0 route, replacing with instance {instance_id}")
-                      ec2.replace_route(
-                          RouteTableId=route_table_id,
-                          DestinationCidrBlock='0.0.0.0/0',
-                          InstanceId=instance_id
-                      )
-                      logger.info(f"Successfully replaced route in {route_table_id}")
+                  # Build list of route table name patterns to update
+                  if shared_nat:
+                      rt_suffixes = ['a', 'b', 'c']
+                      logger.info(f"Shared NAT mode: updating all private route tables")
                   else:
-                      logger.info(f"No existing 0.0.0.0/0 route found, creating new route to instance {instance_id}")
-                      ec2.create_route(
-                          RouteTableId=route_table_id,
-                          DestinationCidrBlock='0.0.0.0/0',
-                          InstanceId=instance_id
-                      )
-                      logger.info(f"Successfully created route in {route_table_id}")
+                      rt_suffixes = [az[-1]]
                   
-                  logger.info(f"Route update completed successfully for instance {instance_id}")
+                  for suffix in rt_suffixes:
+                      route_table_name = f"{instance_name}-{stack_name}-private-rt-{suffix}"
+                      logger.info(f"Looking for route table: {route_table_name}")
+                      
+                      rt_response = ec2.describe_route_tables(
+                          Filters=[{'Name': 'tag:Name', 'Values': [route_table_name]}]
+                      )
+                      
+                      if not rt_response['RouteTables']:
+                          logger.info(f"Route table {route_table_name} not found, skipping")
+                          continue
+                      
+                      route_table = rt_response['RouteTables'][0]
+                      route_table_id = route_table['RouteTableId']
+                      existing_route = any(r.get('DestinationCidrBlock') == '0.0.0.0/0' for r in route_table.get('Routes', []))
+                      
+                      if existing_route:
+                          ec2.replace_route(RouteTableId=route_table_id, DestinationCidrBlock='0.0.0.0/0', InstanceId=instance_id)
+                      else:
+                          ec2.create_route(RouteTableId=route_table_id, DestinationCidrBlock='0.0.0.0/0', InstanceId=instance_id)
+                      logger.info(f"Updated route in {route_table_id} to instance {instance_id}")
+                  
                   return {'statusCode': 200, 'body': 'Route updated successfully'}
                   
               except Exception as e:
